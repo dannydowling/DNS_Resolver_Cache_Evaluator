@@ -482,7 +482,7 @@ void DisplayInterface() {
     printf("----------------------------------------------------------------------------------------\n");
     SetConsoleColor(COLOR_WHITE);
     printf("[F] Flush DNS Cache   [R] Refresh Cache List   [P] Pause/Resume   [Q] Quit\n");
-    printf("[→] Next Page   [←] Previous Page   [V] View Full Cache   [C] Network Config\n");
+    printf("[N] Next Page   [B] Previous Page   [V] View Full Cache   [C] Network Config\n");
 
     SetConsoleColor(COLOR_RESET);
     fflush(stdout);
@@ -526,13 +526,15 @@ void ProcessInput() {
             g_pauseMonitoring = !g_pauseMonitoring;
             break;
 
-        case 77: // Right arrow
+        case 'N': 
+		case 'n':
             if (g_currentPage < g_stats.pagesTotal - 1) {
                 g_currentPage++;
             }
             break;
 
-        case 75: // Left arrow
+        case 'B':
+		case 'b':
             if (g_currentPage > 0) {
                 g_currentPage--;
             }
