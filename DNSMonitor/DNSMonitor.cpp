@@ -229,11 +229,35 @@ void UpdateCacheEntries() {
 
     auto now = std::chrono::steady_clock::now();
 
-    // Test a few entries each cycle to avoid blocking
-    int testsPerCycle = min(3, (int)g_cacheEntries.size());
+    // Test more entries each cycle, but prioritize untested ones
+    int testsPerCycle = min(10, (int)g_cacheEntries.size());
     static int testIndex = 0;
 
-    for (int i = 0; i < testsPerCycle; i++) {
+    // First, try to find untested entries
+    std::vector<int> untestedIndices;
+    for (int i = 0; i < g_cacheEntries.size(); i++) {
+        auto timeSinceTest = std::chrono::duration_cast<std::chrono::seconds>(now - g_cacheEntries[i].lastTested);
+        if (timeSinceTest.count() > 300) { // Haven't been tested in 5 minutes
+            untestedIndices.push_back(i);
+        }
+    }
+
+    // Test untested entries first
+    int testsPerformed = 0;
+    for (int idx : untestedIndices) {
+        if (testsPerformed >= testsPerCycle) break;
+
+        auto& entry = g_cacheEntries[idx];
+        DWORD responseTime = TestCacheEntry(entry.hostname);
+
+        entry.lastResponseTime = responseTime;
+        entry.isReachable = (responseTime != MAXDWORD);
+        entry.lastTested = now;
+        testsPerformed++;
+    }
+
+    // Fill remaining test slots with regular rotation
+    for (int i = testsPerformed; i < testsPerCycle; i++) {
         if (testIndex >= g_cacheEntries.size()) {
             testIndex = 0;
         }
@@ -242,7 +266,7 @@ void UpdateCacheEntries() {
 
         // Only test if it's been a while since last test
         auto timeSinceTest = std::chrono::duration_cast<std::chrono::seconds>(now - entry.lastTested);
-        if (timeSinceTest.count() > 30) { // Test every 30 seconds
+        if (timeSinceTest.count() > 15) { // Test every 15 seconds
             DWORD responseTime = TestCacheEntry(entry.hostname);
 
             entry.lastResponseTime = responseTime;
@@ -307,11 +331,11 @@ int GetResponseTimeColor(DWORD responseTime) {
 
 // Get status indicator
 const char* GetStatusIndicator(bool isReachable, DWORD responseTime, bool isStale) {
-    if (isStale) return "S";
-    if (!isReachable) return "X";
-    if (responseTime <= 50) return "●";
-    if (responseTime <= SLOW_RESPONSE_THRESHOLD) return "○";
-    return "◦";
+    if (isStale) return "Stale";
+    if (!isReachable) return "Missing";
+    if (responseTime <= 50) return "Fast";
+    if (responseTime <= SLOW_RESPONSE_THRESHOLD) return "Ok";
+    return "Slow";
 }
 
 // Display current page of cache entries
@@ -436,11 +460,11 @@ void DisplayLegend() {
     SetConsoleColor(COLOR_WHITE);
     printf("Status: ");
     SetConsoleColor(COLOR_GREEN);
-    printf("● Fast (<50ms)  ");
+    printf("Fast (<50ms)  ");
     SetConsoleColor(COLOR_YELLOW);
-    printf("○ OK (<200ms)  ");
+    printf("OK (<200ms)  ");
     SetConsoleColor(COLOR_RED);
-    printf("◦ Slow (>200ms)  X Timeout  S Stale");
+    printf("Slow (>200ms)  Timeout  Stale");
     printf("\n\n");
 }
 
