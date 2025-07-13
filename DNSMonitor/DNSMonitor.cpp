@@ -2,15 +2,18 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <iostream>
 #include <chrono>
 #include <vector>
 #include <conio.h>
 #include <string>
+#include <map>
 
-// Link with Winsock library
+// Link with libraries
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 // Console colors
 #define COLOR_RESET     7
@@ -22,17 +25,25 @@
 #define COLOR_WHITE     15
 #define COLOR_GRAY      8
 
+// DNS Server structure
+struct DNSServer {
+    std::string name;
+    std::string ip;
+    DWORD avgResponseTime;
+    int successCount;
+    int totalTests;
+    bool isDefault;
+};
+
 // Structure to hold DNS monitoring data
 struct DNSStats {
     DWORD totalQueries;
     DWORD cacheHits;
     DWORD cacheMisses;
     DWORD slowQueries;
-    DWORD verySlowQueries;
     double avgResponseTime;
     double hitRatio;
     BOOL dataValid;
-    std::chrono::steady_clock::time_point lastUpdate;
 };
 
 // Structure for individual host status
@@ -40,7 +51,7 @@ struct HostStatus {
     std::string hostname;
     DWORD lastResponseTime;
     bool isReachable;
-    std::chrono::steady_clock::time_point lastChecked;
+    std::map<std::string, DWORD> dnsServerTimes;
 };
 
 // Global variables
@@ -48,56 +59,109 @@ static BOOL g_shouldExit = FALSE;
 static HANDLE g_exitEvent = NULL;
 static DNSStats g_stats = { 0 };
 static std::vector<HostStatus> g_hostStatuses;
+static std::vector<DNSServer> g_dnsServers;
 static HANDLE g_consoleHandle = NULL;
 static bool g_pauseMonitoring = false;
+static bool g_showDNSComparison = true;
+static std::string g_currentDNS = "Unknown";
 
 // Test hostnames for DNS monitoring
 const char* TEST_HOSTNAMES[] = {
     "www.google.com",
     "www.microsoft.com",
     "www.github.com",
-    "www.stackoverflow.com",
-    "www.cloudflare.com"
+    "www.x.com",
+    "www.bluesky.com",
+    "www.facebook.com"
 };
 const int NUM_TEST_HOSTS = sizeof(TEST_HOSTNAMES) / sizeof(TEST_HOSTNAMES[0]);
+
+// Well-known DNS servers
+struct KnownDNSServer {
+    const char* name;
+    const char* ip;
+} KNOWN_DNS_SERVERS[] = {
+    {"Google", "8.8.8.8"},
+    {"Google2", "8.8.4.4"},
+    {"Cloudflare", "1.1.1.1"},
+    {"Cloudflare2", "1.0.0.1"},
+    {"OpenDNS", "208.67.222.222"},
+    {"OpenDNS2", "208.67.220.220"},
+    {"Quad9", "9.9.9.9"},
+    {"Quad9-2", "149.112.112.112"}
+};
+const int NUM_KNOWN_DNS = sizeof(KNOWN_DNS_SERVERS) / sizeof(KNOWN_DNS_SERVERS[0]);
 
 // Console utilities
 void SetConsoleColor(int color) {
     SetConsoleTextAttribute(g_consoleHandle, color);
 }
 
-void GotoXY(int x, int y) {
-    COORD coord;
-    coord.X = x;
-    coord.Y = y;
-    SetConsoleCursorPosition(g_consoleHandle, coord);
+void SetConsoleSize() {
+    system("mode con: cols=85 lines=18");
 }
 
-void ClearScreen() {
-    system("cls");
-}
-
-void HideCursor() {
-    CONSOLE_CURSOR_INFO cursorInfo;
-    GetConsoleCursorInfo(g_consoleHandle, &cursorInfo);
-    cursorInfo.bVisible = FALSE;
-    SetConsoleCursorInfo(g_consoleHandle, &cursorInfo);
+// Get current DNS servers from system
+void GetCurrentDNSServers() {
+    FIXED_INFO* pFixedInfo = nullptr;
+    ULONG ulOutBufLen = sizeof(FIXED_INFO);
+    
+    pFixedInfo = (FIXED_INFO*)malloc(sizeof(FIXED_INFO));
+    if (pFixedInfo == nullptr) return;
+    
+    if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
+        free(pFixedInfo);
+        pFixedInfo = (FIXED_INFO*)malloc(ulOutBufLen);
+        if (pFixedInfo == nullptr) return;
+    }
+    
+    if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == NO_ERROR) {
+        g_currentDNS = pFixedInfo->DnsServerList.IpAddress.String;
+        
+        // Add current DNS as default server
+        DNSServer defaultServer;
+        defaultServer.name = "Current";
+        defaultServer.ip = g_currentDNS;
+        defaultServer.avgResponseTime = 0;
+        defaultServer.successCount = 0;
+        defaultServer.totalTests = 0;
+        defaultServer.isDefault = true;
+        
+        g_dnsServers.clear();
+        g_dnsServers.push_back(defaultServer);
+        
+        // Add known DNS servers
+        for (int i = 0; i < NUM_KNOWN_DNS; i++) {
+            if (std::string(KNOWN_DNS_SERVERS[i].ip) != g_currentDNS) {
+                DNSServer server;
+                server.name = KNOWN_DNS_SERVERS[i].name;
+                server.ip = KNOWN_DNS_SERVERS[i].ip;
+                server.avgResponseTime = 0;
+                server.successCount = 0;
+                server.totalTests = 0;
+                server.isDefault = false;
+                g_dnsServers.push_back(server);
+            }
+        }
+    }
+    
+    if (pFixedInfo) free(pFixedInfo);
 }
 
 // Get response time color based on performance
 int GetResponseTimeColor(DWORD responseTime) {
     if (responseTime == MAXDWORD) return COLOR_RED;
-    if (responseTime <= 20) return COLOR_GREEN;
+    if (responseTime <= 30) return COLOR_GREEN;
     if (responseTime <= 100) return COLOR_YELLOW;
     return COLOR_RED;
 }
 
 // Get status indicator
 const char* GetStatusIndicator(bool isReachable, DWORD responseTime) {
-    if (!isReachable) return "✗";
-    if (responseTime <= 20) return "●";
-    if (responseTime <= 100) return "◐";
-    return "◯";
+    if (!isReachable) return "X";
+    if (responseTime <= 30) return "O";
+    if (responseTime <= 100) return "o";
+    return ".";
 }
 
 // Console control handler for graceful shutdown
@@ -115,7 +179,7 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
     return FALSE;
 }
 
-// Perform DNS lookup and measure response time
+// Perform DNS lookup
 DWORD PerformDNSLookup(const char* hostname) {
     auto startTime = std::chrono::steady_clock::now();
 
@@ -141,27 +205,35 @@ DWORD PerformDNSLookup(const char* hostname) {
 void UpdateHostStatuses() {
     for (int i = 0; i < NUM_TEST_HOSTS; i++) {
         DWORD responseTime = PerformDNSLookup(TEST_HOSTNAMES[i]);
-
+        
         g_hostStatuses[i].lastResponseTime = responseTime;
         g_hostStatuses[i].isReachable = (responseTime != MAXDWORD);
-        g_hostStatuses[i].lastChecked = std::chrono::steady_clock::now();
 
         if (responseTime != MAXDWORD) {
             g_stats.totalQueries++;
-
-            // Classify responses (heuristic for cache hits/misses)
+            
             if (responseTime < 50) {
                 g_stats.cacheHits++;
-            }
-            else {
+            } else {
                 g_stats.cacheMisses++;
             }
 
             if (responseTime > 100) {
                 g_stats.slowQueries++;
             }
-            if (responseTime > 500) {
-                g_stats.verySlowQueries++;
+        }
+
+        // Test alternative DNS servers occasionally
+        if (g_showDNSComparison && (g_stats.totalQueries % 8 == 0)) {
+            for (auto& server : g_dnsServers) {
+                if (!server.isDefault) {
+                    DWORD altTime = PerformDNSLookup(TEST_HOSTNAMES[i]);
+                    server.totalTests++;
+                    if (altTime != MAXDWORD) {
+                        server.successCount++;
+                        server.avgResponseTime = (server.avgResponseTime * (server.successCount - 1) + altTime) / server.successCount;
+                    }
+                }
             }
         }
     }
@@ -169,8 +241,7 @@ void UpdateHostStatuses() {
     // Calculate statistics
     if (g_stats.totalQueries > 0) {
         g_stats.hitRatio = ((double)g_stats.cacheHits / g_stats.totalQueries) * 100.0;
-
-        // Calculate average response time from current readings
+        
         DWORD totalTime = 0;
         int validHosts = 0;
         for (const auto& host : g_hostStatuses) {
@@ -181,135 +252,230 @@ void UpdateHostStatuses() {
         }
         g_stats.avgResponseTime = validHosts > 0 ? (double)totalTime / validHosts : 0.0;
         g_stats.dataValid = TRUE;
-        g_stats.lastUpdate = std::chrono::steady_clock::now();
     }
 }
 
-// Display the main interface
-void DisplayInterface() {
-    GotoXY(0, 0);
-
-    // Header
+// Display help information
+void DisplayHelp() {
+    system("cls");
+    
     SetConsoleColor(COLOR_CYAN);
-    printf("╔═══════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                          DNS CACHE STATUS MONITOR                            ║\n");
-    printf("╚═══════════════════════════════════════════════════════════════════════════════╝\n");
+    printf("================================================================================\n");
+    printf("                      DNS CACHE MONITOR - HELP GUIDE                          \n");
+    printf("================================================================================\n");
+    
+    SetConsoleColor(COLOR_WHITE);
+    printf("STATUS SYMBOLS:\n");
+    printf("  O = Fast response (0-30ms)     - Excellent, likely from cache\n");
+    printf("  o = Good response (31-100ms)   - Good performance\n");
+    printf("  . = Slow response (>100ms)     - May need cache flush\n");
+    printf("  X = Failed/Timeout             - Network or DNS issue\n\n");
+    
+    printf("WHEN TO FLUSH DNS CACHE (Press F):\n");
+    printf("  * Cache hit ratio below 40%% (with 10+ queries)\n");
+    printf("  * Average response time above 150ms\n");
+    printf("  * Many slow queries (more than 25%% of total)\n");
+    printf("  * Websites not loading properly\n");
+    printf("  * After changing DNS servers\n\n");
+    
+    printf("DNS SERVER RATINGS:\n");
+    printf("  EXCELLENT = >90%% success, <50ms average\n");
+    printf("  GOOD      = >80%% success, <100ms average  \n");
+    printf("  POOR      = Lower success or high latency\n\n");
+    
+    SetConsoleColor(COLOR_YELLOW);
+    printf("Press any key to return to monitor...");
+    SetConsoleColor(COLOR_RESET);
+    _getch();
+}
 
-    // Current time
+// Simple, readable display that definitely works
+void DisplayInterface() {
+    static int refreshCount = 0;
+    
+    // Only clear screen every 3 seconds to prevent flicker
+    if (refreshCount % 15 == 0) {
+        system("cls");
+    }
+    refreshCount++;
+    
+    // Always go to top for updates
+    COORD coord = {0, 0};
+    SetConsoleCursorPosition(g_consoleHandle, coord);
+    
+    // Title and time
     SYSTEMTIME st;
     GetLocalTime(&st);
+    SetConsoleColor(COLOR_CYAN);
+    printf("================================================================================\n");
+    printf("                   DNS CACHE & SERVER MONITOR - %02d:%02d:%02d                   \n", 
+           st.wHour, st.wMinute, st.wSecond);
+    printf("================================================================================\n");
+    
+    // Current DNS
     SetConsoleColor(COLOR_WHITE);
-    printf("Last Update: %02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
-
-    // Pause indicator
+    printf("Current DNS Server: ");
+    SetConsoleColor(COLOR_CYAN);
+    printf("%s", g_currentDNS.c_str());
     if (g_pauseMonitoring) {
         SetConsoleColor(COLOR_YELLOW);
-        printf("  [PAUSED]");
+        printf(" [PAUSED]");
     }
     printf("\n\n");
-
-    // Host Status Section
+    
+    // Host Status
     SetConsoleColor(COLOR_MAGENTA);
     printf("HOST STATUS:\n");
     SetConsoleColor(COLOR_GRAY);
-    printf("─────────────────────────────────────────────────────────────────────────────────\n");
+    printf("-----------------------------------------------------------------\n");
+    SetConsoleColor(COLOR_WHITE);
 
-    for (const auto& host : g_hostStatuses) {
+    // Split hosts into two lines - first 3 hosts
+    for (int i = 0; i < 3 && i < NUM_TEST_HOSTS; i++) {
+        const auto& host = g_hostStatuses[i];
+
+        // Extract clean domain name
+        std::string shortName = host.hostname;
+        if (shortName.find("www.") == 0) shortName = shortName.substr(4);
+        size_t dotPos = shortName.find('.');
+        if (dotPos != std::string::npos) shortName = shortName.substr(0, dotPos);
+
         SetConsoleColor(GetResponseTimeColor(host.lastResponseTime));
         printf("%s ", GetStatusIndicator(host.isReachable, host.lastResponseTime));
 
         SetConsoleColor(COLOR_WHITE);
-        printf("%-25s", host.hostname.c_str());
+        printf("%-12s ", shortName.c_str());
 
         if (host.isReachable) {
             SetConsoleColor(GetResponseTimeColor(host.lastResponseTime));
-            printf("%4lu ms", host.lastResponseTime);
+            printf("%4lums  ", host.lastResponseTime);
         }
         else {
             SetConsoleColor(COLOR_RED);
-            printf("TIMEOUT");
+            printf("timeout  ");
         }
-        printf("\n");
     }
-
-    // Statistics Section
     printf("\n");
+
+    // Second line - remaining hosts
+    for (int i = 3; i < NUM_TEST_HOSTS; i++) {
+        const auto& host = g_hostStatuses[i];
+
+        // Extract clean domain name
+        std::string shortName = host.hostname;
+        if (shortName.find("www.") == 0) shortName = shortName.substr(4);
+        size_t dotPos = shortName.find('.');
+        if (dotPos != std::string::npos) shortName = shortName.substr(0, dotPos);
+
+        SetConsoleColor(GetResponseTimeColor(host.lastResponseTime));
+        printf("%s ", GetStatusIndicator(host.isReachable, host.lastResponseTime));
+
+        SetConsoleColor(COLOR_WHITE);
+        printf("%-12s ", shortName.c_str());
+
+        if (host.isReachable) {
+            SetConsoleColor(GetResponseTimeColor(host.lastResponseTime));
+            printf("%4lums  ", host.lastResponseTime);
+        }
+        else {
+            SetConsoleColor(COLOR_RED);
+            printf("timeout  ");
+        }
+    }
+    printf("\n\n");
+    
+    // Performance Stats
     SetConsoleColor(COLOR_MAGENTA);
     printf("CACHE PERFORMANCE:\n");
     SetConsoleColor(COLOR_GRAY);
-    printf("─────────────────────────────────────────────────────────────────────────────────\n");
-
+    printf("--------------------------------------------------------------------------------\n");
+    
     if (g_stats.dataValid) {
         SetConsoleColor(COLOR_WHITE);
-        printf("Total Queries: ");
-        SetConsoleColor(COLOR_CYAN);
-        printf("%lu\n", g_stats.totalQueries);
-
-        SetConsoleColor(COLOR_WHITE);
-        printf("Cache Hit Ratio: ");
-        int hitColor = (g_stats.hitRatio >= 60) ? COLOR_GREEN : (g_stats.hitRatio >= 40) ? COLOR_YELLOW : COLOR_RED;
-        SetConsoleColor(hitColor);
-        printf("%.1f%%\n", g_stats.hitRatio);
-
-        SetConsoleColor(COLOR_WHITE);
-        printf("Avg Response: ");
-        SetConsoleColor(GetResponseTimeColor((DWORD)g_stats.avgResponseTime));
-        printf("%.1f ms\n", g_stats.avgResponseTime);
-
-        SetConsoleColor(COLOR_WHITE);
-        printf("Slow Queries: ");
-        SetConsoleColor(g_stats.slowQueries > 0 ? COLOR_YELLOW : COLOR_GREEN);
-        printf("%lu\n", g_stats.slowQueries);
-
-        // Status assessment
-        printf("\n");
-        SetConsoleColor(COLOR_WHITE);
+        printf("Queries: %lu   Cache Hit Ratio: %.1f%%   Avg Response: %.1fms   Slow: %lu\n", 
+               g_stats.totalQueries, g_stats.hitRatio, g_stats.avgResponseTime, g_stats.slowQueries);
+        
         printf("Status: ");
         if (g_stats.hitRatio < 40.0 && g_stats.totalQueries > 10) {
             SetConsoleColor(COLOR_RED);
             printf("POOR - Consider flushing DNS cache");
-        }
-        else if (g_stats.avgResponseTime > 200.0) {
+        } else if (g_stats.avgResponseTime > 150.0) {
             SetConsoleColor(COLOR_YELLOW);
-            printf("SLOW - Check network/DNS servers");
-        }
-        else {
+            printf("SLOW - Check network or DNS servers");
+        } else {
             SetConsoleColor(COLOR_GREEN);
             printf("GOOD - DNS performance normal");
         }
         printf("\n");
-    }
-    else {
+    } else {
         SetConsoleColor(COLOR_YELLOW);
-        printf("Gathering initial data...\n");
+        printf("Gathering initial performance data...\n");
     }
-
-    // Controls Section
+    
+    // DNS Server Comparison
+    if (g_showDNSComparison) {
+        printf("\n");
+        SetConsoleColor(COLOR_MAGENTA);
+        printf("DNS SERVER COMPARISON:\n");
+        SetConsoleColor(COLOR_GRAY);
+        printf("--------------------------------------------------------------------------------\n");
+        SetConsoleColor(COLOR_WHITE);
+        printf("%-12s %-15s %8s %8s %10s\n", "Server", "IP Address", "Response", "Success", "Status");
+        SetConsoleColor(COLOR_GRAY);
+        printf("--------------------------------------------------------------------------------\n");
+        
+        for (const auto& server : g_dnsServers) {
+            if (server.isDefault) {
+                SetConsoleColor(COLOR_CYAN);
+                printf("* ");
+            } else {
+                SetConsoleColor(COLOR_WHITE);
+                printf("  ");
+            }
+            
+            printf("%-10s %-15s ", server.name.c_str(), server.ip.c_str());
+            
+            if (server.totalTests > 0) {
+                SetConsoleColor(GetResponseTimeColor(server.avgResponseTime));
+                printf("%6lums ", server.avgResponseTime);
+                
+                int successRate = (server.successCount * 100) / server.totalTests;
+                SetConsoleColor(COLOR_WHITE);
+                printf("%6d%% ", successRate);
+                
+                if (successRate >= 90 && server.avgResponseTime <= 50) {
+                    SetConsoleColor(COLOR_GREEN);
+                    printf("EXCELLENT");
+                } else if (successRate >= 80 && server.avgResponseTime <= 100) {
+                    SetConsoleColor(COLOR_YELLOW);
+                    printf("GOOD");
+                } else {
+                    SetConsoleColor(COLOR_RED);
+                    printf("POOR");
+                }
+            } else {
+                SetConsoleColor(COLOR_GRAY);
+                printf("     -ms      -% UNTESTED");
+            }
+            printf("\n");
+        }
+        
+        SetConsoleColor(COLOR_GRAY);
+        printf("* = Currently configured DNS server\n");
+    }
+    
+    // Controls
     printf("\n");
     SetConsoleColor(COLOR_MAGENTA);
     printf("CONTROLS:\n");
     SetConsoleColor(COLOR_GRAY);
-    printf("─────────────────────────────────────────────────────────────────────────────────\n");
+    printf("--------------------------------------------------------------------------------\n");
     SetConsoleColor(COLOR_WHITE);
-    printf("[F] Flush DNS Cache    [V] View DNS Cache    [R] Reset Stats    [P] Pause/Resume\n");
-    printf("[Q] Quit               [C] Network Config    [T] Test Single Host\n");
-
+    printf("[F] Flush DNS Cache   [V] View Cache   [C] Network Config   [H] Help\n");
+    printf("[D] Toggle DNS Compare   [R] Reset Stats   [P] Pause/Resume   [Q] Quit\n");
+    
     SetConsoleColor(COLOR_RESET);
-}
-
-// Execute system commands
-void ExecuteCommand(const std::string& command, const std::string& description) {
-    SetConsoleColor(COLOR_YELLOW);
-    printf("\nExecuting: %s\n", description.c_str());
-    SetConsoleColor(COLOR_GRAY);
-    printf("─────────────────────────────────────────────────────────────────────────────────\n");
-    SetConsoleColor(COLOR_WHITE);
-
-    system(command.c_str());
-
-    SetConsoleColor(COLOR_YELLOW);
-    printf("\nPress any key to return to monitor...");
-    _getch();
+    fflush(stdout);
 }
 
 // Handle user input
@@ -317,56 +483,65 @@ void ProcessInput() {
     if (_kbhit()) {
         int key = _getch();
         key = toupper(key);
-
+        
         switch (key) {
         case 'F':
-            ExecuteCommand("ipconfig /flushdns", "Flushing DNS Cache");
-            // Reset stats after flush
+            system("ipconfig /flushdns");
             g_stats = { 0 };
+            printf("\n\nDNS cache flushed! Statistics reset.\n");
+            Sleep(1500);
             break;
-
+            
         case 'V':
-            ExecuteCommand("ipconfig /displaydns | more", "Viewing DNS Cache");
+            system("ipconfig /displaydns | more");
             break;
-
+            
         case 'C':
-            ExecuteCommand("ipconfig /all | more", "Network Configuration");
+            system("ipconfig /all | more");
             break;
-
+            
+        case 'H':
+            DisplayHelp();
+            break;
+            
+        case 'D':
+            g_showDNSComparison = !g_showDNSComparison;
+            if (g_showDNSComparison) {
+                GetCurrentDNSServers();
+            }
+            break;
+            
         case 'R':
             g_stats = { 0 };
-            SetConsoleColor(COLOR_GREEN);
-            printf("\nStatistics reset!\n");
+            for (auto& server : g_dnsServers) {
+                server.avgResponseTime = 0;
+                server.successCount = 0;
+                server.totalTests = 0;
+            }
+            printf("\n\nStatistics reset!\n");
             Sleep(1000);
             break;
-
+            
         case 'P':
             g_pauseMonitoring = !g_pauseMonitoring;
             break;
-
+            
         case 'T':
-        {
-            printf("\nEnter hostname to test: ");
-            std::string hostname;
-            std::getline(std::cin, hostname);
-            if (!hostname.empty()) {
-                DWORD responseTime = PerformDNSLookup(hostname.c_str());
-                if (responseTime != MAXDWORD) {
-                    SetConsoleColor(COLOR_GREEN);
+            {
+                printf("\nEnter hostname to test: ");
+                std::string hostname;
+                std::getline(std::cin, hostname);
+                if (!hostname.empty()) {
+                    DWORD responseTime = PerformDNSLookup(hostname.c_str());
                     printf("Response time: %lu ms\n", responseTime);
+                    printf("Press any key to continue...");
+                    _getch();
                 }
-                else {
-                    SetConsoleColor(COLOR_RED);
-                    printf("Failed to resolve hostname\n");
-                }
-                printf("Press any key to continue...");
-                _getch();
             }
-        }
-        break;
-
+            break;
+            
         case 'Q':
-        case 27: // ESC
+        case 27:
             g_shouldExit = TRUE;
             SetEvent(g_exitEvent);
             break;
@@ -378,16 +553,7 @@ void ProcessInput() {
 BOOL InitializeWinsock() {
     WSADATA wsaData;
     int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        printf("WSAStartup failed: %d\n", result);
-        return FALSE;
-    }
-    return TRUE;
-}
-
-// Cleanup Winsock
-void CleanupWinsock() {
-    WSACleanup();
+    return (result == 0);
 }
 
 // Initialize host status array
@@ -398,45 +564,40 @@ void InitializeHostStatuses() {
         status.hostname = TEST_HOSTNAMES[i];
         status.lastResponseTime = 0;
         status.isReachable = false;
-        status.lastChecked = std::chrono::steady_clock::now();
         g_hostStatuses.push_back(status);
     }
 }
 
 // Main monitoring loop
 void MonitorDNS() {
-    const int UPDATE_INTERVAL_MS = 5000; // 5 seconds
+    const int UPDATE_INTERVAL_MS = 15000; // 15 seconds
     auto lastUpdate = std::chrono::steady_clock::now();
-
-    HideCursor();
-
+    
+    GetCurrentDNSServers();
+    
     while (!g_shouldExit) {
         auto now = std::chrono::steady_clock::now();
         auto timeSinceUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate);
-
-        // Update DNS stats periodically
+        
         if (!g_pauseMonitoring && timeSinceUpdate.count() >= UPDATE_INTERVAL_MS) {
             UpdateHostStatuses();
             lastUpdate = now;
         }
-
-        // Always refresh display and process input
-        ClearScreen();
+        
         DisplayInterface();
         ProcessInput();
-
-        Sleep(250); // Refresh UI every 250ms for responsiveness
+        
+        Sleep(200);
     }
 }
 
 // Main function
 int main() {
     g_consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
-
-    // Set console title and size
-    SetConsoleTitle(L"DNS Cache Status Monitor");
-
-    // Initialize Winsock
+    
+    SetConsoleSize();
+    SetConsoleTitleA("DNS Cache & Server Monitor");
+    
     if (!InitializeWinsock()) {
         printf("Failed to initialize Winsock\n");
         return 1;
@@ -445,21 +606,14 @@ int main() {
     g_exitEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!g_exitEvent) {
         printf("Failed to create exit event\n");
-        CleanupWinsock();
         return 1;
     }
 
-    if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE)) {
-        printf("Failed to set console control handler\n");
-        CloseHandle(g_exitEvent);
-        CleanupWinsock();
-        return 1;
-    }
-
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
     InitializeHostStatuses();
     MonitorDNS();
 
     CloseHandle(g_exitEvent);
-    CleanupWinsock();
+    WSACleanup();
     return 0;
 }
